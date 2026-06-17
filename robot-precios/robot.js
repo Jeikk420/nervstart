@@ -1,16 +1,17 @@
 /**
  * ============================================================
- * 🤖 ROBOT COMPARADOR DE PRECIOS — Chile
+ * 🤖 ROBOT COMPARADOR DE PRECIOS — Chile (REFACTORIZADO)
  * Jumbo · Santa Isabel · Tottus · Alvi · Acuenta
  * ============================================================
  */
 
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-puppeteer.use(StealthPlugin());
+const logger = require('./logger');
+const config = require('./config');
+const cache = require('./cache');
 
-const PRECIO_MIN = 500;
-const PRECIO_MAX = 150000;
+puppeteer.use(StealthPlugin());
 
 // ============================================================
 // CORRECCIÓN DE TEXTO
@@ -134,11 +135,14 @@ async function scrollear(page) {
 
 async function navegar(page, url, ms=4000) {
     try {
-        await page.goto(url, { waitUntil:'networkidle2', timeout:45000 });
+        await page.goto(url, { waitUntil:'networkidle2', timeout: config.TIMEOUT_MS });
         await wait(ms);
         await cerrarPopups(page);
         return true;
-    } catch { return false; }
+    } catch (err) {
+        logger.warn('Navigation failed', { url, error: err.message });
+        return false;
+    }
 }
 
 // ============================================================
@@ -165,8 +169,11 @@ async function precioFontSize(page) {
             if (!cands.length) return null;
             cands.sort((a,b)=>b.fs!==a.fs?b.fs-a.fs:a.top-b.top);
             return cands[0];
-        }, PRECIO_MIN, PRECIO_MAX);
-    } catch { return null; }
+        }, config.PRECIO_MIN, config.PRECIO_MAX);
+    } catch (err) {
+        logger.warn('Price extraction error', { error: err.message });
+        return null;
+    }
 }
 
 async function extraerPrecio(page) {
@@ -176,7 +183,7 @@ async function extraerPrecio(page) {
 
 async function precioTottus(page) {
     try {
-        await page.waitForSelector('span.copy15', {timeout:12000});
+        await page.waitForSelector('span.copy15', {timeout: config.NAV_TIMEOUT});
         const ps = await page.$$eval('span.copy15', spans=>spans.map(el=>({
             t:el.textContent.trim(),
             tachado:window.getComputedStyle(el).textDecorationLine?.includes('line-through'),
@@ -184,11 +191,14 @@ async function precioTottus(page) {
         })));
         for (const p of ps) {
             if (p.tachado||!p.vis) continue;
-            const m=p.t.match(/\d{1,3}(?:\.\d{3})*/); if (!m) continue;
+            const m=p.t.match(/\d{1,3}(?:\.\d{3})*/);
+            if (!m) continue;
             const n=parseInt(m[0].replace(/\./g,''),10);
-            if (n>=PRECIO_MIN&&n<=PRECIO_MAX) return {texto:fmt(n),numero:n};
+            if (n >= config.PRECIO_MIN && n <= config.PRECIO_MAX) return {texto:fmt(n),numero:n};
         }
-    } catch {}
+    } catch (err) {
+        logger.warn('Tottus price extraction error', { error: err.message });
+    }
     return null;
 }
 
@@ -200,7 +210,7 @@ async function mejorLink(page, selectores, query, limite=8) {
     let best=null, bestScore=-1;
     for (const sel of selectores) {
         try {
-            await page.waitForSelector(sel, {timeout:5000});
+            await page.waitForSelector(sel, {timeout: config.NAV_TIMEOUT});
             const links = await page.$$eval(sel, (els,lim)=>
                 els.slice(0,lim).map(el=>{
                     const a=el.tagName==='A'?el:el.querySelector('a');
@@ -209,32 +219,30 @@ async function mejorLink(page, selectores, query, limite=8) {
             );
             for (const l of links) {
                 if (!l.href.startsWith('http')) continue;
-                // Ignorar links que claramente son de otra categoría
                 const urlLower = l.href.toLowerCase();
                 if (urlLower.includes('panal')||urlLower.includes('paño')||urlLower.includes('hygiene')) continue;
                 const score = relevancia(`${l.texto} ${l.href}`, query);
                 if (score > bestScore) { bestScore=score; best=l; }
             }
             if (best && bestScore>=0.35) break;
-        } catch {}
+        } catch (err) {
+            logger.debug('Link search error', { selector: sel, error: err.message });
+        }
     }
     return {link:best, score:bestScore};
 }
 
 // ============================================================
 // PROCESADORES POR TIENDA
-// Cada uno crea su propia page para evitar "detached frame"
 // ============================================================
 
 async function procesarJumbo(browser, query) {
     const page = await browser.newPage();
     try {
-        // Jumbo VTEX: la URL de búsqueda correcta
         const urls = [
             `https://www.jumbo.cl/${encodeURIComponent(query)}?map=ft`,
             `https://www.jumbo.cl/busca?q=${encodeURIComponent(query)}&map=ft`,
         ];
-        // Selectores actualizados para VTEX IO (versión más reciente de Jumbo)
         const sels = [
             'a.vtex-product-summary-2-x-clearLink',
             '[class*="vtex-product-summary"] a',
@@ -244,17 +252,17 @@ async function procesarJumbo(browser, query) {
             'a[href$="/p"]',
         ];
         for (const url of urls) {
-            console.log(`   [jumbo] ↳ ${url}`);
+            logger.debug('Jumbo search', { url });
             if (!await navegar(page, url, 5000)) continue;
             const {link, score} = await mejorLink(page, sels, query);
-            if (!link || score<0.3) { console.log(`   [jumbo] ⚠ score bajo: ${score.toFixed(2)}`); continue; }
-            console.log(`   [jumbo] ✓ score:${score.toFixed(2)} → ${link.href}`);
+            if (!link || score<0.3) { logger.debug('Jumbo low score', { score }); continue; }
+            logger.debug('Jumbo found product', { score: score.toFixed(2), href: link.href });
             if (!await navegar(page, link.href, 4000)) continue;
             const titulo = await page.title();
             const rel = relevancia(titulo, query);
-            if (rel < 0.3) { console.log(`   [jumbo] ⚠ PDP no relevante (${rel.toFixed(2)}): ${titulo}`); continue; }
+            if (rel < 0.3) { logger.warn('Jumbo product not relevant', { titulo, rel }); continue; }
             const precio = await extraerPrecio(page);
-            if (precio) { console.log(`   [jumbo] ✅ ${precio.texto}`); return precio; }
+            if (precio) { logger.info('Jumbo price found', { precio: precio.texto }); return precio; }
         }
         return null;
     } finally { await page.close().catch(()=>{}); }
@@ -275,17 +283,17 @@ async function procesarSantaIsabel(browser, query) {
             'a[href$="/p"]',
         ];
         for (const url of urls) {
-            console.log(`   [santaisabel] ↳ ${url}`);
+            logger.debug('Santa Isabel search', { url });
             if (!await navegar(page, url, 5000)) continue;
             const {link, score} = await mejorLink(page, sels, query);
-            if (!link || score<0.3) { console.log(`   [santaisabel] ⚠ score: ${score.toFixed(2)}`); continue; }
-            console.log(`   [santaisabel] ✓ score:${score.toFixed(2)} → ${link.href}`);
+            if (!link || score<0.3) { logger.debug('Santa Isabel low score', { score }); continue; }
+            logger.debug('Santa Isabel found product', { score: score.toFixed(2), href: link.href });
             if (!await navegar(page, link.href, 4000)) continue;
             const titulo = await page.title();
             const rel = relevancia(titulo, query);
-            if (rel < 0.3) { console.log(`   [santaisabel] ⚠ PDP no relevante (${rel.toFixed(2)}): ${titulo}`); continue; }
+            if (rel < 0.3) { logger.warn('Santa Isabel product not relevant', { titulo, rel }); continue; }
             const precio = await extraerPrecio(page);
-            if (precio) { console.log(`   [santaisabel] ✅ ${precio.texto}`); return precio; }
+            if (precio) { logger.info('Santa Isabel price found', { precio: precio.texto }); return precio; }
         }
         return null;
     } finally { await page.close().catch(()=>{}); }
@@ -304,19 +312,19 @@ async function procesarTottus(browser, query) {
             '[class*="product"] a[href*="articulo"]',
         ];
         for (const url of urls) {
-            console.log(`   [tottus] ↳ ${url}`);
+            logger.debug('Tottus search', { url });
             if (!await navegar(page, url, 7000)) continue;
             await scrollear(page);
             const {link, score} = await mejorLink(page, sels, query);
-            if (!link || score<0.3) { console.log(`   [tottus] ⚠ score: ${score.toFixed(2)}`); continue; }
-            console.log(`   [tottus] ✓ score:${score.toFixed(2)} → ${link.href}`);
+            if (!link || score<0.3) { logger.debug('Tottus low score', { score }); continue; }
+            logger.debug('Tottus found product', { score: score.toFixed(2), href: link.href });
             if (!await navegar(page, link.href, 7000)) continue;
             await scrollear(page);
             const titulo = await page.title();
             const rel = relevancia(titulo, query);
-            if (rel < 0.3) { console.log(`   [tottus] ⚠ PDP no relevante (${rel.toFixed(2)}): ${titulo}`); continue; }
+            if (rel < 0.3) { logger.warn('Tottus product not relevant', { titulo, rel }); continue; }
             let precio = await precioTottus(page) || await extraerPrecio(page);
-            if (precio) { console.log(`   [tottus] ✅ ${precio.texto}`); return precio; }
+            if (precio) { logger.info('Tottus price found', { precio: precio.texto }); return precio; }
         }
         return null;
     } finally { await page.close().catch(()=>{}); }
@@ -337,17 +345,17 @@ async function procesarAlvi(browser, query) {
             'article a',
         ];
         for (const url of urls) {
-            console.log(`   [alvi] ↳ ${url}`);
+            logger.debug('Alvi search', { url });
             if (!await navegar(page, url, 5000)) continue;
             const {link, score} = await mejorLink(page, sels, query);
-            if (!link || score<0.3) { console.log(`   [alvi] ⚠ score: ${score.toFixed(2)}`); continue; }
-            console.log(`   [alvi] ✓ score:${score.toFixed(2)} → ${link.href}`);
+            if (!link || score<0.3) { logger.debug('Alvi low score', { score }); continue; }
+            logger.debug('Alvi found product', { score: score.toFixed(2), href: link.href });
             if (!await navegar(page, link.href, 4000)) continue;
             const titulo = await page.title();
             const rel = relevancia(titulo, query);
-            if (rel < 0.3) { console.log(`   [alvi] ⚠ PDP no relevante (${rel.toFixed(2)}): ${titulo}`); continue; }
+            if (rel < 0.3) { logger.warn('Alvi product not relevant', { titulo, rel }); continue; }
             const precio = await extraerPrecio(page);
-            if (precio) { console.log(`   [alvi] ✅ ${precio.texto}`); return precio; }
+            if (precio) { logger.info('Alvi price found', { precio: precio.texto }); return precio; }
         }
         return null;
     } finally { await page.close().catch(()=>{}); }
@@ -369,23 +377,22 @@ async function procesarAcuenta(browser, query) {
             'article a',
         ];
         for (const url of urls) {
-            console.log(`   [acuenta] ↳ ${url}`);
+            logger.debug('Acuenta search', { url });
             if (!await navegar(page, url, 5000)) continue;
             const {link, score} = await mejorLink(page, sels, query, 10);
-            if (!link || score<0.35) { console.log(`   [acuenta] ⚠ score: ${score.toFixed(2)}`); continue; }
-            // Verificar que la URL no sea de categoría errónea
+            if (!link || score<0.35) { logger.debug('Acuenta low score', { score }); continue; }
             const urlLower = link.href.toLowerCase();
             if (urlLower.includes('panal')||urlLower.includes('paño')||urlLower.includes('bebe')) {
-                console.log(`   [acuenta] ⚠ URL descartada por categoría: ${link.href}`);
+                logger.debug('Acuenta URL filtered by category', { href: link.href });
                 continue;
             }
-            console.log(`   [acuenta] ✓ score:${score.toFixed(2)} → ${link.href}`);
+            logger.debug('Acuenta found product', { score: score.toFixed(2), href: link.href });
             if (!await navegar(page, link.href, 4000)) continue;
             const titulo = await page.title();
             const rel = relevancia(titulo, query);
-            if (rel < 0.35) { console.log(`   [acuenta] ⚠ PDP no relevante (${rel.toFixed(2)}): ${titulo}`); continue; }
+            if (rel < 0.35) { logger.warn('Acuenta product not relevant', { titulo, rel }); continue; }
             const precio = await extraerPrecio(page);
-            if (precio) { console.log(`   [acuenta] ✅ ${precio.texto}`); return precio; }
+            if (precio) { logger.info('Acuenta price found', { precio: precio.texto }); return precio; }
         }
         return null;
     } finally { await page.close().catch(()=>{}); }
@@ -396,11 +403,19 @@ async function procesarAcuenta(browser, query) {
 // ============================================================
 
 async function buscarYComparar(queryOriginal) {
+    // Verificar cache primero
+    const cacheKey = queryOriginal.toLowerCase().trim();
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        logger.info('Cache hit for query', { query: queryOriginal });
+        return cached;
+    }
+
     const query = corregirTexto(queryOriginal) || queryOriginal;
-    console.log(`\n🚀 Buscando: "${query}" (original: "${queryOriginal}")`);
+    logger.info('Starting search', { originalQuery: queryOriginal, correctedQuery: query });
 
     const browser = await puppeteer.launch({
-        headless: false,
+        headless: config.HEADLESS,
         defaultViewport: null,
         args: ['--no-sandbox','--disable-setuid-sandbox'],
     });
@@ -415,13 +430,22 @@ async function buscarYComparar(queryOriginal) {
             procesarAcuenta(browser, query),
         ]);
 
-        return {
+        const resultado = {
             jumbo:       j.status==='fulfilled'  ? j.value  : null,
             santaisabel: si.status==='fulfilled' ? si.value : null,
             tottus:      t.status==='fulfilled'  ? t.value  : null,
             alvi:        a.status==='fulfilled'  ? a.value  : null,
             acuenta:     ac.status==='fulfilled' ? ac.value : null,
         };
+
+        // Guardar en cache
+        cache.set(cacheKey, resultado);
+        logger.info('Search completed and cached', { query: queryOriginal });
+
+        return resultado;
+    } catch (err) {
+        logger.error('Search error', { error: err.message });
+        throw err;
     } finally {
         await browser.close().catch(()=>{});
     }
